@@ -376,6 +376,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_region_chosen, pattern="^find_region_"))
     app.add_handler(CallbackQueryHandler(on_upgrade_now, pattern="^upgrade_now$"))
     app.add_handler(CallbackQueryHandler(on_find_again, pattern="^find_again$"))
+    app.add_handler(CommandHandler("upgrade", cmd_upgrade))
+
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay_message))
     print("🤖 Bot aktif dan siap jalan...")
     app.run_polling()
