@@ -1,61 +1,40 @@
 """
-Telegram Anonymous Dating Bot (JSON storage) + Pakasir QRIS upgrade (15 hari PRO)
-
-Sebelum menjalankan:
-- Set environment variables:
-    - BOT_TOKEN (token dari @BotFather)
-    - PAKASIR_SLUG (contoh: bottelegrampremium)
-    - PAKASIR_API_KEY (API key dari Pakasir)
-    - PRO_PRICE (opsional, default 20000 rupiah)
-
-Contoh (Windows PowerShell):
-  $env:BOT_TOKEN="123:ABC..."
-  $env:PAKASIR_SLUG="bottelegrampremium"
-  $env:PAKASIR_API_KEY="SECRET_API_KEY"
-  $env:PRO_PRICE="20000"
-
-Install dependency:
-  pip install python-telegram-bot==20.5 requests
-
-Jalankan:
-  python bot.py
+Telegram Anonymous Dating Bot (Interactive PRO version + Pakasir QRIS integration)
 """
 
 import os
 import uuid
 import json
-import time
-from datetime import datetime, timedelta
+import random
 import requests
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
-
-from telegram import Update, InputFile
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
-# ----------------- CONFIG -----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # required
-PAKASIR_SLUG = os.getenv("PAKASIR_SLUG")  # example: bottelegrampremium
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PAKASIR_SLUG = os.getenv("PAKASIR_SLUG")
 PAKASIR_API_KEY = os.getenv("PAKASIR_API_KEY")
-PRO_PRICE = int(os.getenv("PRO_PRICE", "20000"))  # in IDR
-PRO_DURATION_DAYS = 15  # PRO valid for 15 days
-
+PRO_PRICE = int(os.getenv("PRO_PRICE", "20000"))
+PRO_DURATION_DAYS = 15
 USERS_FILE = "users.json"
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is required. Set it before running.")
+    raise RuntimeError("BOT_TOKEN environment variable is required.")
 
-if not PAKASIR_SLUG or not PAKASIR_API_KEY:
-    # We allow running without payments for testing, but /upgrade will warn.
-    print("WARNING: PAKASIR_SLUG or PAKASIR_API_KEY not set. /upgrade will be disabled until set.")
-
-
-# ----------------- DATA STORAGE -----------------
+# ---------------- DATA STORAGE ----------------
 def load_users() -> Dict[str, Any]:
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as f:
@@ -63,44 +42,15 @@ def load_users() -> Dict[str, Any]:
     except FileNotFoundError:
         return {}
 
-
 def save_users(data: Dict[str, Any]) -> None:
     with open(USERS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-
 users = load_users()
-# Structure per user_id (string):
-# users[user_id] = {
-#   "gender": "pria" or "wanita",
-#   "region": "Jawa Barat",
-#   "is_pro": False,
-#   "pro_expiry": "<iso-timestamp>" or None,
-#   "pending_orders": [order_id, ...]  # optional
-# }
+users_waiting: Dict[int, Dict[str, Any]] = {}
+active_chats: Dict[int, int] = {}
 
-pending_transactions: Dict[str, int] = {}  # order_id -> user_id (int)
-
-
-# ----------------- VALID REGIONS (PROVINSI INDONESIA) -----------------
-VALID_REGIONS = [
-    "Aceh", "Sumatera Utara", "Sumatera Barat", "Riau", "Jambi", "Sumatera Selatan",
-    "Bengkulu", "Lampung", "Kepulauan Bangka Belitung", "Kepulauan Riau", "Jakarta",
-    "Jawa Barat", "Jawa Tengah", "Yogyakarta", "Jawa Timur", "Banten", "Bali",
-    "Nusa Tenggara Barat", "Nusa Tenggara Timur", "Kalimantan Barat", "Kalimantan Tengah",
-    "Kalimantan Selatan", "Kalimantan Timur", "Kalimantan Utara", "Sulawesi Utara",
-    "Sulawesi Tengah", "Sulawesi Selatan", "Sulawesi Tenggara", "Gorontalo",
-    "Sulawesi Barat", "Maluku", "Maluku Utara", "Papua", "Papua Barat", "Papua Tengah",
-    "Papua Pegunungan", "Papua Selatan", "Papua Barat Daya"
-]
-
-
-# ----------------- MATCHING STATE -----------------
-users_waiting: Dict[int, Dict[str, Any]] = {}  # user_id -> metadata (for quick checks)
-active_chats: Dict[int, int] = {}  # user_id -> partner_id
-
-
-# ----------------- HELPERS -----------------
+# ---------------- HELPERS ----------------
 def ensure_user_record(uid: int, username: Optional[str] = None) -> None:
     sid = str(uid)
     if sid not in users:
@@ -116,360 +66,271 @@ def ensure_user_record(uid: int, username: Optional[str] = None) -> None:
         save_users(users)
 
 def get_user(uid: int) -> Dict[str, Any]:
-    """Ambil data user dari file JSON, buat baru kalau belum ada."""
     ensure_user_record(uid)
     return users[str(uid)]
 
-
-
 def is_pro_active(uid: int) -> bool:
-    sid = str(uid)
-    rec = users.get(sid)
-    if not rec:
+    rec = users.get(str(uid))
+    if not rec or not rec.get("is_pro"):
         return False
-    if rec.get("is_pro"):
-        expiry = rec.get("pro_expiry")
-        if expiry:
-            try:
-                exp_dt = datetime.fromisoformat(expiry)
-                return datetime.utcnow() <= exp_dt
-            except Exception:
-                return False
-    return False
-
+    exp = rec.get("pro_expiry")
+    if not exp:
+        return False
+    try:
+        return datetime.utcnow() <= datetime.fromisoformat(exp)
+    except Exception:
+        return False
 
 def set_pro_for_user(uid: int, days: int = PRO_DURATION_DAYS) -> None:
-    sid = str(uid)
-    ensure_user_record(uid)
     expiry = datetime.utcnow() + timedelta(days=days)
-    users[sid]["is_pro"] = True
-    users[sid]["pro_expiry"] = expiry.isoformat()
+    users[str(uid)]["is_pro"] = True
+    users[str(uid)]["pro_expiry"] = expiry.isoformat()
     save_users(users)
 
-
 def validate_region_input(text: str) -> Optional[str]:
-    # try to match by title-casing, allow exact matches ignoring case
-    candidate = text.strip()
-    for r in VALID_REGIONS:
-        if candidate.lower() == r.lower():
-            return r
-    # try simple fuzzy match: startswith
-    candidate2 = candidate.lower()
-    for r in VALID_REGIONS:
-        if r.lower().startswith(candidate2) or candidate2 in r.lower():
+    valid = [
+        "Aceh", "Sumatera Utara", "Sumatera Barat", "Riau", "Jambi", "Sumatera Selatan",
+        "Bengkulu", "Lampung", "Kepulauan Bangka Belitung", "Kepulauan Riau", "Jakarta",
+        "Jawa Barat", "Jawa Tengah", "Yogyakarta", "Jawa Timur", "Banten", "Bali",
+        "Nusa Tenggara Barat", "Nusa Tenggara Timur", "Kalimantan Barat", "Kalimantan Tengah",
+        "Kalimantan Selatan", "Kalimantan Timur", "Kalimantan Utara", "Sulawesi Utara",
+        "Sulawesi Tengah", "Sulawesi Selatan", "Sulawesi Tenggara", "Gorontalo",
+        "Sulawesi Barat", "Maluku", "Maluku Utara", "Papua", "Papua Barat"
+    ]
+    t = text.strip().lower()
+    for r in valid:
+        if t in r.lower() or r.lower().startswith(t):
             return r
     return None
 
-
-# ----------------- COMMANDS -----------------
+# ---------------- COMMANDS ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user_record(user.id, user.username)
+    u = update.effective_user
+    ensure_user_record(u.id, u.username)
     await update.message.reply_text(
         "👋 Selamat datang di Anonymous Dating Bot!\n\n"
-        "WAJIB: isi dulu profil dasar:\n"
+        "Isi dulu profil kamu:\n"
         "• /setgender <pria|wanita>\n"
         "• /setregion <nama provinsi>\n\n"
-        "Perintah lainnya:\n"
-        "• /find — cari pasangan (PRO bisa pakai filter)\n"
-        "• /stop — hentikan percakapan / pencarian\n"
-        "• /upgrade — bayar PRO via Pakasir QRIS\n"
-        "• /verifypro — cek pembayaran dan aktifkan PRO\n"
-        "• /status — lihat status PRO\n"
+        "Perintah lain:\n"
+        "• /find — mulai mencari pasangan\n"
+        "• /stop — keluar dari chat\n"
+        "• /upgrade — jadi PRO 💎\n"
+        "• /pro — lihat status & keuntungan PRO\n"
     )
 
-
 async def cmd_setgender(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user_record(user.id, user.username)
+    u = update.effective_user
+    ensure_user_record(u.id)
     if not context.args:
         await update.message.reply_text("Format: /setgender <pria|wanita>")
         return
-    arg = context.args[0].lower()
-    if arg not in ("pria", "wanita"):
-        await update.message.reply_text("Gender tidak valid. Pilih 'pria' atau 'wanita'.")
+    g = context.args[0].lower()
+    if g not in ("pria", "wanita"):
+        await update.message.reply_text("Pilih 'pria' atau 'wanita'.")
         return
-    users[str(user.id)]["gender"] = arg
+    users[str(u.id)]["gender"] = g
     save_users(users)
-    await update.message.reply_text(f"✅ Gender diset: {arg}")
-
+    await update.message.reply_text(f"✅ Gender diset: {g}")
 
 async def cmd_setregion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user_record(user.id, user.username)
+    u = update.effective_user
+    ensure_user_record(u.id)
     if not context.args:
-        await update.message.reply_text("Format: /setregion <nama provinsi>")
+        await update.message.reply_text("Format: /setregion <provinsi>")
         return
-    text = " ".join(context.args)
-    region = validate_region_input(text)
+    region = validate_region_input(" ".join(context.args))
     if not region:
-        await update.message.reply_text(
-            "Provinsi tidak dikenali. Contoh provinsi yang valid:\n" + ", ".join(VALID_REGIONS[:8]) +
-            "\n\nGunakan nama provinsi lengkap atau kata kunci (mis. 'Jawa Barat')."
-        )
+        await update.message.reply_text("Provinsi tidak dikenali. Contoh: Jawa Barat, Bali, Jakarta.")
         return
-    users[str(user.id)]["region"] = region
+    users[str(u.id)]["region"] = region
     save_users(users)
     await update.message.reply_text(f"✅ Wilayah diset: {region}")
 
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user_record(user.id, user.username)
-    sid = str(user.id)
-    rec = users.get(sid, {})
-    is_pro = is_pro_active(user.id)
-    if is_pro:
-        exp = rec.get("pro_expiry")
-        await update.message.reply_text(f"💎 Kamu PRO sampai {exp} (UTC)")
-    else:
-        await update.message.reply_text("🆓 Kamu user biasa. Ketik /upgrade untuk jadi PRO.")
-
-
-# ----------------- UPGRADE / VERIFY via Pakasir -----------------
-async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user_record(user.id, user.username)
-
-    if not PAKASIR_SLUG or not PAKASIR_API_KEY:
+async def cmd_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user_record(u.id)
+    if is_pro_active(u.id):
+        exp = users[str(u.id)]["pro_expiry"]
         await update.message.reply_text(
-            "⚠️ Fitur upgrade belum aktif: PAKASIR_SLUG atau PAKASIR_API_KEY belum diset di environment."
+            f"💎 Kamu pengguna PRO aktif!\n"
+            f"Berlaku sampai {exp}\n\n"
+            "Fitur PRO:\n"
+            "• Filter gender & wilayah\n"
+            "• Match lebih cepat\n"
+            "• Masa aktif 15 hari"
         )
-        return
+    else:
+        await update.message.reply_text(
+            "🆓 Kamu user biasa.\n\n"
+            f"Upgrade ke PRO cuma Rp{PRO_PRICE:,}\n"
+            "• Bisa pilih gender & wilayah\n"
+            "• Prioritas match\n"
+            f"Ketik /upgrade untuk bayar via QRIS 💳"
+        )
 
-    if is_pro_active(user.id):
-        await update.message.reply_text("✅ Kamu sudah PRO.")
-        return
-
-    # create order id
-    order_id = str(uuid.uuid4())
-    pending_transactions[order_id] = user.id
-    # also persist into user's pending_orders
-    users[str(user.id)].setdefault("pending_orders", []).append(order_id)
-    save_users(users)
-
-    payment_url = f"https://app.pakasir.com/pay/{PAKASIR_SLUG}/{PRO_PRICE}?order_id={order_id}&qris_only=1"
-    await update.message.reply_text(
-        "💎 Upgrade ke PRO (masa aktif 15 hari)\n"
-        f"Harga: Rp{PRO_PRICE:,}\n\n"
-        "Silakan bayar lewat link QRIS berikut:\n"
-        f"{payment_url}\n\n"
-        "Setelah membayar, kembali ke chat dan kirim /verifypro untuk cek otomatis."
-    )
-
-
-async def cmd_verifypro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user_record(user.id, user.username)
-
-    # find any pending order for this user
-    sid = str(user.id)
-    pending = users.get(sid, {}).get("pending_orders", [])
-    if not pending:
-        await update.message.reply_text("⚠️ Tidak ada transaksi pending untuk akun ini.")
-        return
-
-    # iterate pending orders and check status via Pakasir transactiondetail API
-    verified_any = False
-    for order_id in pending[:]:  # copy list
-        params = {
-            "project": PAKASIR_SLUG,
-            "order_id": order_id,
-            "amount": PRO_PRICE,
-            "api_key": PAKASIR_API_KEY,
-        }
-        try:
-            resp = requests.get("https://app.pakasir.com/api/transactiondetail", params=params, timeout=10)
-        except requests.RequestException as e:
-            await update.message.reply_text(f"❌ Gagal menghubungi server verifikasi: {e}")
-            return
-
-        if resp.status_code != 200:
-            await update.message.reply_text(f"❌ Server verifikasi merespon {resp.status_code}. Coba lagi nanti.")
-            return
-
-        try:
-            data = resp.json()
-        except Exception:
-            await update.message.reply_text("❌ Respon server verifikasi tidak valid (bukan JSON).")
-            return
-
-        # try to extract transaction object; pakasir may return in different keys
-        tx = data.get("transaction") or data.get("data") or data
-        status = None
-        if isinstance(tx, dict):
-            status = tx.get("status") or tx.get("payment_status") or tx.get("state")
-        elif isinstance(tx, list) and len(tx) > 0 and isinstance(tx[0], dict):
-            status = tx[0].get("status")
-
-        if not status:
-            await update.message.reply_text("⚠️ Tidak menemukan status pembayaran pada response.")
-            return
-
-        status_low = str(status).lower()
-        if status_low in ("completed", "paid", "success"):
-            # mark user pro for PRO_DURATION_DAYS
-            set_pro_for_user(user.id, days=PRO_DURATION_DAYS)
-            # remove pending order from both in-memory and persisted list
-            if order_id in pending_transactions:
-                del pending_transactions[order_id]
-            users[sid]["pending_orders"].remove(order_id)
-            save_users(users)
-            verified_any = True
-            await update.message.reply_text("✅ Pembayaran terverifikasi! Kamu sekarang PRO selama 15 hari.")
-        else:
-            # not yet paid
-            await update.message.reply_text(f"🔄 Order {order_id} status: {status}. Mohon tunggu atau periksa kembali.")
-
-    if not verified_any:
-        await update.message.reply_text("🔎 Tidak ada transaksi yang terverifikasi saat ini.")
-
-
-# ----------------- FIND / STOP / MATCHING -----------------
+# ---------------- FIND / INTERAKTIF ----------------
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-
-    # Cegah double find
-    if user_id in active_chats:
-        await update.message.reply_text("Kamu sedang dalam percakapan. Ketik /stop untuk keluar.")
-        return
+    u = update.effective_user
+    user = get_user(u.id)
 
     if not user.get("gender") or not user.get("region"):
-        await update.message.reply_text("Kamu harus set gender dan wilayah dulu dengan /setgender dan /setregion.")
+        await update.message.reply_text("Isi dulu data kamu pakai /setgender dan /setregion.")
         return
 
-    print(f"[FIND] {user_id} ({user['gender']}, {user['region']}) mulai mencari...")
+    if u.id in active_chats:
+        await update.message.reply_text("Kamu masih dalam percakapan. /stop dulu kalau mau cari lagi.")
+        return
 
-    # Cari partner yang cocok
-    for pid, pdata in users_waiting.copy().items():
+    # USER BIASA → langsung cari random + tombol upgrade
+    if not is_pro_active(u.id):
+        keyboard = [[InlineKeyboardButton("💎 Upgrade PRO", callback_data="upgrade_now")]]
+        markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"🆓 Kamu user biasa, pencarian acak tanpa filter.\n"
+            f"💎 Mau cari berdasarkan gender & wilayah?\n"
+            f"Upgrade cuma Rp{PRO_PRICE:,} — /upgrade sekarang!",
+            reply_markup=markup,
+        )
+        await start_search(u.id, None, None, update, context)
+        return
+
+    # USER PRO → pilih gender
+    keyboard = [
+        [
+            InlineKeyboardButton("👨 Pria", callback_data="find_gender_pria"),
+            InlineKeyboardButton("👩 Wanita", callback_data="find_gender_wanita"),
+        ]
+    ]
+    await update.message.reply_text("Pilih gender target:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def on_gender_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    g = q.data.split("_")[-1]
+    context.user_data["target_gender"] = g
+
+    regions = ["Jakarta", "Jawa Barat", "Jawa Timur", "Bali", "Sumatera Utara", "Kalimantan Timur"]
+    keyboard = [[InlineKeyboardButton(r, callback_data=f"find_region_{r}")] for r in regions]
+    keyboard.append([InlineKeyboardButton("🌏 Lainnya...", callback_data="find_region_more")])
+    await q.edit_message_text(
+        text=f"Gender target: {g}\n\nSekarang pilih wilayah:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def on_region_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    region = q.data.replace("find_region_", "")
+    if region == "more":
+        await q.edit_message_text("Ketik manual: /find <gender> <provinsi>\nContoh: /find wanita Bali")
+        return
+    gender = context.user_data.get("target_gender")
+    await q.edit_message_text(f"🎯 Target: {gender}, 📍 {region}\n\n🔎 Mencari pasangan...")
+    await start_search(q.from_user.id, gender, region, q, context)
+
+async def start_search(user_id: int, target_gender: Optional[str], target_region: Optional[str], update, context):
+    u = get_user(user_id)
+    for pid, _ in users_waiting.copy().items():
         if pid == user_id:
             continue
-
-        partner = get_user(pid)
-
-        # 🟡 Kalau user PRO → filter gender & region
-        if user.get("is_pro"):
-            if partner["region"] != user["region"]:
+        p = get_user(pid)
+        if is_pro_active(user_id):
+            if target_gender and p.get("gender") != target_gender:
                 continue
-            if partner["gender"] == user["gender"]:
+            if target_region and p.get("region") != target_region:
                 continue
-        else:
-            # 🔵 Kalau user biasa → lewati semua filter
-            pass
-
-        # Match!
         active_chats[user_id] = pid
         active_chats[pid] = user_id
         users_waiting.pop(pid, None)
-        await update.message.reply_text("🔗 Kamu terhubung! Ketik /stop untuk keluar.")
+        await context.bot.send_message(user_id, "🔗 Kamu terhubung! Ketik /stop untuk keluar.")
         await context.bot.send_message(pid, "🔗 Kamu terhubung! Ketik /stop untuk keluar.")
-        print(f"[MATCH] {user_id} terhubung dengan {pid}")
+        print(f"[MATCH] {user_id} ↔ {pid}")
         return
 
-    # Kalau belum dapat pasangan
-    users_waiting[user_id] = {"gender": user["gender"], "region": user["region"]}
-    await update.message.reply_text("Menunggu pasangan...")
-    print(f"[WAIT] {user_id} belum dapat pasangan, masuk waiting pool.")
+    users_waiting[user_id] = {"gender": u["gender"], "region": u["region"]}
+    msg = "Menunggu pasangan..."
+    if target_gender:
+        msg += f"\n🎯 Gender: {target_gender}"
+    if target_region:
+        msg += f"\n📍 Wilayah: {target_region}"
+    await context.bot.send_message(user_id, msg)
+    print(f"[WAIT] {user_id} waiting.")
 
-
+# ---------------- STOP ----------------
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    # if chatting -> inform partner
-    if user.id in active_chats:
-        partner = active_chats[user.id]
-        await update.message.reply_text("❌ Kamu keluar dari percakapan.")
-        await context.bot.send_message(partner, "❌ Pasanganmu keluar dari percakapan.")
-        del active_chats[partner]
-        del active_chats[user.id]
+    u = update.effective_user
+    if u.id in active_chats:
+        p = active_chats[u.id]
+        await update.message.reply_text("❌ Kamu keluar dari chat.")
+        await context.bot.send_message(p, "❌ Pasanganmu keluar dari chat.")
+        del active_chats[p]
+        del active_chats[u.id]
+
+        # tombol cari lagi
+        keyboard = [
+            [InlineKeyboardButton("🔁 Cari lagi", callback_data="find_again")],
+            [InlineKeyboardButton("💎 Upgrade PRO", callback_data="upgrade_now")],
+        ]
+        await update.message.reply_text("Mau cari lagi atau upgrade?", reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    # if waiting -> remove from queue
-    if user.id in users_waiting:
-        users_waiting.pop(user.id, None)
+
+    if u.id in users_waiting:
+        users_waiting.pop(u.id, None)
         await update.message.reply_text("🚫 Pencarian dibatalkan.")
-        return
-    await update.message.reply_text("Kamu sedang tidak dalam pencarian atau percakapan.")
+    else:
+        await update.message.reply_text("Kamu sedang tidak mencari pasangan.")
 
+# ---------------- CALLBACKS ----------------
+async def on_upgrade_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(f"💎 Upgrade ke PRO cuma Rp{PRO_PRICE:,}!\nKetik /upgrade untuk bayar via QRIS 📲")
 
-# ----------------- MESSAGE RELAY (TEXT + MEDIA) -----------------
+async def on_find_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("🔁 Oke, mencari lagi...")
+    await cmd_find(q, context)
+
+# ---------------- RELAY ----------------
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in active_chats:
-        await update.message.reply_text("Kamu belum terhubung. Gunakan /find untuk mulai mencari.")
+    u = update.effective_user
+    if u.id not in active_chats:
+        await update.message.reply_text("Kamu belum terhubung. Gunakan /find untuk mencari.")
         return
-
-    partner_id = active_chats.get(user.id)
-    if not partner_id:
-        await update.message.reply_text("⚠️ Pasangan tidak ditemukan. Gunakan /stop lalu /find lagi.")
-        return
-
+    pid = active_chats[u.id]
     msg = update.message
-
     try:
-        # Text
         if msg.text:
-            await context.bot.send_message(chat_id=partner_id, text=msg.text)
-
-        # Photo (largest)
+            await context.bot.send_message(pid, msg.text)
         elif msg.photo:
-            file_id = msg.photo[-1].file_id
-            caption = msg.caption or ""
-            await context.bot.send_photo(chat_id=partner_id, photo=file_id, caption=caption)
-
-        # Video
+            await context.bot.send_photo(pid, msg.photo[-1].file_id, caption=msg.caption or "")
         elif msg.video:
-            file_id = msg.video.file_id
-            caption = msg.caption or ""
-            await context.bot.send_video(chat_id=partner_id, video=file_id, caption=caption)
-
-        # Document (pdf, other)
-        elif msg.document:
-            file_id = msg.document.file_id
-            caption = msg.caption or ""
-            await context.bot.send_document(chat_id=partner_id, document=file_id, caption=caption)
-
-        # Voice
-        elif msg.voice:
-            file_id = msg.voice.file_id
-            await context.bot.send_voice(chat_id=partner_id, voice=file_id)
-
-        # Audio
-        elif msg.audio:
-            file_id = msg.audio.file_id
-            await context.bot.send_audio(chat_id=partner_id, audio=file_id)
-
-        # Sticker
+            await context.bot.send_video(pid, msg.video.file_id, caption=msg.caption or "")
         elif msg.sticker:
-            await context.bot.send_sticker(chat_id=partner_id, sticker=msg.sticker.file_id)
-
+            await context.bot.send_sticker(pid, msg.sticker.file_id)
         else:
-            # fallback: try forward (kehilangan anon), or respond not supported
-            await update.message.reply_text("Tipe pesan ini belum didukung untuk diteruskan.")
+            await update.message.reply_text("Jenis pesan ini belum didukung.")
     except Exception as e:
-        # if sending fails, inform user
-        await update.message.reply_text(f"Error saat mengirim ke pasangan: {e}")
+        await update.message.reply_text(f"⚠️ Gagal mengirim: {e}")
 
-
-# ----------------- APP RUN -----------------
+# ---------------- RUN ----------------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("setgender", cmd_setgender))
     app.add_handler(CommandHandler("setregion", cmd_setregion))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("upgrade", cmd_upgrade))
-    app.add_handler(CommandHandler("verifypro", cmd_verifypro))
-
     app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("stop", cmd_stop))
-
-    # relay all non-command messages (text & media) to partner if connected
+    app.add_handler(CommandHandler("pro", cmd_pro))
+    app.add_handler(CallbackQueryHandler(on_gender_chosen, pattern="^find_gender_"))
+    app.add_handler(CallbackQueryHandler(on_region_chosen, pattern="^find_region_"))
+    app.add_handler(CallbackQueryHandler(on_upgrade_now, pattern="^upgrade_now$"))
+    app.add_handler(CallbackQueryHandler(on_find_again, pattern="^find_again$"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay_message))
-
-    print("🤖 Bot berjalan...")
+    print("🤖 Bot aktif dan siap jalan...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
