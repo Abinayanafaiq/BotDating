@@ -34,6 +34,7 @@ USERS_FILE = "users.json"
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required.")
 
+
 # ---------------- DATA STORAGE ----------------
 def load_users() -> Dict[str, Any]:
     try:
@@ -116,6 +117,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /find — mulai mencari pasangan\n"
         "• /stop — keluar dari chat\n"
         "• /upgrade — jadi PRO 💎\n"
+        "• /verifypro — verifikasi pembayaran\n"
         "• /pro — lihat status & keuntungan PRO\n"
     )
 
@@ -293,54 +295,66 @@ async def on_find_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("🔁 Oke, mencari lagi...")
     await cmd_find(q, context)
 
-# ---------------- RELAY ----------------
+
 # ---------------- UPGRADE ----------------
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     ensure_user_record(u.id)
-
     order_id = str(uuid.uuid4())
-    order_payload = {
-        "order_ref_id": order_id,
-        "price": PRO_PRICE,
-        "description": f"Upgrade PRO untuk @{u.username or u.id}",
-        "callback_url": f"https://pakasir.com/api/callback/{PAKASIR_SLUG}",
-    }
+    payment_url = f"https://app.pakasir.com/pay/{PAKASIR_SLUG}/{PRO_PRICE}?order_id={order_id}&qris_only=1"
 
-    headers = {
-        "Authorization": f"Bearer {PAKASIR_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    # simpan order
+    user = get_user(u.id)
+    user.setdefault("pending_orders", []).append(order_id)
+    save_users(users)
 
-    try:
-        r = requests.post(
-            f"https://api.pakasir.com/v1/{PAKASIR_SLUG}/orders",
-            headers=headers,
-            json=order_payload,
-            timeout=15,
-        )
-        res = r.json()
-        if "data" in res and "qris_url" in res["data"]:
-            qris_url = res["data"]["qris_url"]
+    await update.message.reply_text(
+        f"💎 *Upgrade PRO*\n\n"
+        f"Harga: Rp{PRO_PRICE:,}\n"
+        f"Klik link berikut untuk bayar via QRIS:\n\n"
+        f"{payment_url}\n\n"
+        "Setelah membayar, kirim /verifypro untuk aktivasi otomatis.",
+        parse_mode="Markdown",
+    )
 
-            # simpan order pending
-            user = get_user(u.id)
-            user["pending_orders"].append(order_id)
-            save_users(users)
+async def cmd_verifypro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user_record(u.id)
+    user = get_user(u.id)
+    pending = user.get("pending_orders", [])
+    if not pending:
+        await update.message.reply_text("⚠️ Tidak ada transaksi pending.")
+        return
 
-            await update.message.reply_text(
-                f"💎 *Upgrade PRO*\n\n"
-                f"Harga: Rp{PRO_PRICE:,}\n"
-                f"Klik link di bawah untuk bayar via QRIS:\n\n"
-                f"{qris_url}\n\n"
-                f"Setelah bayar, sistem akan otomatis mengaktifkan akun kamu dalam beberapa menit.",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text("⚠️ Gagal membuat order QRIS. Coba lagi nanti.")
+    verified_any = False
+    for order_id in pending[:]:
+        try:
+            params = {
+                "project": PAKASIR_SLUG,
+                "order_id": order_id,
+                "amount": PRO_PRICE,
+                "api_key": PAKASIR_API_KEY,
+            }
+            r = requests.get("https://app.pakasir.com/api/transactiondetail", params=params, timeout=10)
+            data = r.json()
+            tx = data.get("transaction") or data.get("data") or data
+            status = (tx.get("status") or tx.get("payment_status") or "").lower()
 
-    except Exception as e:
-        await update.message.reply_text(f"❌ Terjadi kesalahan: {e}")
+            if status in ("completed", "paid", "success"):
+                set_pro_for_user(u.id)
+                user["pending_orders"].remove(order_id)
+                save_users(users)
+                verified_any = True
+                await update.message.reply_text("✅ Pembayaran diverifikasi! Kamu sekarang PRO selama 15 hari 💎")
+            else:
+                await update.message.reply_text(f"🔄 Order {order_id} status: {status}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Gagal cek transaksi: {e}")
+
+    if not verified_any:
+        await update.message.reply_text("⚠️ Belum ada transaksi yang berhasil.")
+
+# ---------------- RELAY ----------------
 
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
