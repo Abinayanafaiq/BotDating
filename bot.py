@@ -314,7 +314,7 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Klik link berikut untuk bayar via QRIS:\n\n"
         f"{payment_url}\n\n"
         "Setelah membayar, kirim /verifypro untuk aktivasi otomatis.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 async def cmd_verifypro(update: Update, context: ContextTypes.DEFAULT_TYPE):
