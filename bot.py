@@ -294,6 +294,54 @@ async def on_find_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_find(q, context)
 
 # ---------------- RELAY ----------------
+# ---------------- UPGRADE ----------------
+async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    ensure_user_record(u.id)
+
+    order_id = str(uuid.uuid4())
+    order_payload = {
+        "order_ref_id": order_id,
+        "price": PRO_PRICE,
+        "description": f"Upgrade PRO untuk @{u.username or u.id}",
+        "callback_url": f"https://pakasir.com/api/callback/{PAKASIR_SLUG}",
+    }
+
+    headers = {
+        "Authorization": f"Bearer {PAKASIR_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        r = requests.post(
+            f"https://api.pakasir.com/v1/{PAKASIR_SLUG}/orders",
+            headers=headers,
+            json=order_payload,
+            timeout=15,
+        )
+        res = r.json()
+        if "data" in res and "qris_url" in res["data"]:
+            qris_url = res["data"]["qris_url"]
+
+            # simpan order pending
+            user = get_user(u.id)
+            user["pending_orders"].append(order_id)
+            save_users(users)
+
+            await update.message.reply_text(
+                f"💎 *Upgrade PRO*\n\n"
+                f"Harga: Rp{PRO_PRICE:,}\n"
+                f"Klik link di bawah untuk bayar via QRIS:\n\n"
+                f"{qris_url}\n\n"
+                f"Setelah bayar, sistem akan otomatis mengaktifkan akun kamu dalam beberapa menit.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("⚠️ Gagal membuat order QRIS. Coba lagi nanti.")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Terjadi kesalahan: {e}")
+
 async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if u.id not in active_chats:
